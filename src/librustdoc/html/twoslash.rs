@@ -50,31 +50,44 @@ fn resolve_cargo_toml() -> Option<String> {
 /// Parses the crate name from the Cargo.toml and adds it as:
 ///   `crate_name = { path = "/path/to/crate" }`
 fn inject_self_dependency(cargo_toml: &str, crate_path: &str) -> String {
-    let crate_name = cargo_toml
+    let name_line = cargo_toml
         .lines()
-        .find(|l| l.trim().starts_with("name"))
-        .and_then(|l| {
-            let val = l.split('=').nth(1)?.trim();
-            Some(val.trim_matches('"').to_string())
-        });
+        .find(|l| l.trim().starts_with("name"));
 
-    let Some(name) = crate_name else {
+    let Some(name_line) = name_line else {
         return cargo_toml.to_string();
     };
 
+    let crate_name = match name_line.split('=').nth(1) {
+        Some(val) => val.trim().trim_matches('"').to_string(),
+        None => return cargo_toml.to_string(),
+    };
+
+    // Rename the temp project to avoid circular dependency
+    let mut result = cargo_toml.replacen(
+        name_line,
+        &format!("name = \"twoslash-rustdoc-tmp\""),
+        1,
+    );
+
     // Use underscore form for the dependency key (Cargo normalizes hyphens)
-    let dep_key = name.replace('-', "_");
-    let dep_line = format!("{} = {{ path = \"{}\" }}", dep_key, crate_path);
+    let dep_key = crate_name.replace('-', "_");
+    let dep_line = format!(
+        "{} = {{ path = \"{}\", package = \"{}\" }}",
+        dep_key, crate_path, crate_name,
+    );
 
     // Check if [dependencies] section exists
-    if let Some(pos) = cargo_toml.find("[dependencies]") {
+    if let Some(pos) = result.find("[dependencies]") {
         let after = pos + "[dependencies]".len();
         eprintln!("twoslash: adding self-dependency: {}", dep_line);
-        format!("{}\n{}{}", &cargo_toml[..after], dep_line, &cargo_toml[after..])
+        result = format!("{}\n{}{}", &result[..after], dep_line, &result[after..]);
     } else {
         eprintln!("twoslash: adding self-dependency: {}", dep_line);
-        format!("{}\n[dependencies]\n{}\n", cargo_toml, dep_line)
+        result = format!("{}\n[dependencies]\n{}\n", result, dep_line);
     }
+
+    result
 }
 
 /// Information about a type annotation to render
