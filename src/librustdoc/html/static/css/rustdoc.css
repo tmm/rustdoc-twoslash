@@ -3603,7 +3603,7 @@ Original by Dempfi (https://github.com/dempfi/ayu)
     position: fixed;
     z-index: 100000;
     background: var(--main-background-color);
-    border: 1px solid var(--border-color);
+    border: 1px solid color-mix(in srgb, var(--border-color) 50%, transparent);
     border-radius: 6px;
     padding: 0;
     font-size: 0.85em;
@@ -3623,7 +3623,7 @@ Original by Dempfi (https://github.com/dempfi/ayu)
 }
 
 #twoslash-tooltip .twoslash-sig {
-    border-bottom: 1px solid var(--border-color);
+    border-bottom: 1px solid color-mix(in srgb, var(--border-color) 50%, transparent);
     padding: 8px 12px;
 }
 
