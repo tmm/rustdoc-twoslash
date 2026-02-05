@@ -24,18 +24,57 @@ static ANALYZER: Lazy<Mutex<Analyzer>> = Lazy::new(|| {
 /// Cargo.toml relative to the current directory. This lets twoslash-rust
 /// scaffold temp projects with the same dependencies as the crate being documented.
 fn resolve_cargo_toml() -> Option<String> {
-    if let Ok(path) = std::env::var("RUSTDOC_TWOSLASH_CARGO_TOML") {
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            eprintln!("twoslash: using Cargo.toml from {}", path);
-            return Some(content);
+    let cargo_path = std::env::var("RUSTDOC_TWOSLASH_CARGO_TOML")
+        .ok()
+        .unwrap_or_else(|| "Cargo.toml".to_string());
+
+    let content = match std::fs::read_to_string(&cargo_path) {
+        Ok(c) => c,
+        Err(_) => {
+            eprintln!("twoslash: no Cargo.toml found, external deps won't have annotations");
+            return None;
         }
+    };
+
+    eprintln!("twoslash: using Cargo.toml from {}", cargo_path);
+
+    // Add the crate being documented as a path dependency so that
+    // code examples referencing `crate_name::foo` resolve correctly.
+    let crate_dir = std::env::current_dir().ok()?;
+    let augmented = inject_self_dependency(&content, &crate_dir.to_string_lossy());
+    Some(augmented)
+}
+
+/// Inject the crate being documented as a path dependency.
+///
+/// Parses the crate name from the Cargo.toml and adds it as:
+///   `crate_name = { path = "/path/to/crate" }`
+fn inject_self_dependency(cargo_toml: &str, crate_path: &str) -> String {
+    let crate_name = cargo_toml
+        .lines()
+        .find(|l| l.trim().starts_with("name"))
+        .and_then(|l| {
+            let val = l.split('=').nth(1)?.trim();
+            Some(val.trim_matches('"').to_string())
+        });
+
+    let Some(name) = crate_name else {
+        return cargo_toml.to_string();
+    };
+
+    // Use underscore form for the dependency key (Cargo normalizes hyphens)
+    let dep_key = name.replace('-', "_");
+    let dep_line = format!("{} = {{ path = \"{}\" }}", dep_key, crate_path);
+
+    // Check if [dependencies] section exists
+    if let Some(pos) = cargo_toml.find("[dependencies]") {
+        let after = pos + "[dependencies]".len();
+        eprintln!("twoslash: adding self-dependency: {}", dep_line);
+        format!("{}\n{}{}", &cargo_toml[..after], dep_line, &cargo_toml[after..])
+    } else {
+        eprintln!("twoslash: adding self-dependency: {}", dep_line);
+        format!("{}\n[dependencies]\n{}\n", cargo_toml, dep_line)
     }
-    if let Ok(content) = std::fs::read_to_string("Cargo.toml") {
-        eprintln!("twoslash: using Cargo.toml from current directory");
-        return Some(content);
-    }
-    eprintln!("twoslash: no Cargo.toml found, external deps won't have annotations");
-    None
 }
 
 /// Information about a type annotation to render
