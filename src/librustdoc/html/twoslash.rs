@@ -56,57 +56,95 @@ pub fn is_enabled() -> bool {
     std::env::var("RUSTDOC_TWOSLASH").is_ok()
 }
 
-/// Check if code needs to be wrapped in fn main() for analysis
-/// Returns (needs_wrap, use_statements) where use_statements should be placed before fn main
-fn needs_main_wrapper(code: &str) -> (bool, String) {
-    // If it already has fn main, don't wrap
+/// Item-level keyword prefixes that indicate top-level declarations
+const ITEM_KEYWORDS: &[&str] = &[
+    "fn ", "struct ", "enum ", "impl ", "trait ", "mod ",
+    "pub ", "extern ", "const ", "static ", "type ",
+    "use ", "#[", "#!",
+];
+
+/// Check if a line starts a top-level item
+fn is_item_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    ITEM_KEYWORDS.iter().any(|kw| trimmed.starts_with(kw))
+}
+
+/// Split code into preamble (top-level items) and body (statements).
+///
+/// Handles mixed code like:
+/// ```text
+/// fn helper() -> i32 { 42 }     // preamble
+///                                // preamble (blank line)
+/// let x = helper();              // body (needs fn main wrapper)
+/// ```
+///
+/// Returns (preamble, body) where preamble contains complete item definitions
+/// and body contains statement-level code that needs fn main() wrapping.
+/// If no wrapping is needed, body is empty.
+fn split_items_and_statements(code: &str) -> (String, String) {
+    // If code already has fn main, no splitting needed
     if code.contains("fn main") {
-        return (false, String::new());
+        return (code.to_string(), String::new());
     }
-    
-    let trimmed = code.trim_start();
-    
-    // If code starts with item-level keywords (not use), don't wrap
-    let item_keywords = [
-        "fn ", "struct ", "enum ", "impl ", "trait ", "mod ", 
-        "pub ", "extern ", "const ", "static ", "type ",
-        "#[", "#!", 
-    ];
-    
-    for kw in item_keywords {
-        if trimmed.starts_with(kw) {
-            return (false, String::new());
-        }
-    }
-    
-    // Handle 'use' statements specially: extract them and wrap the rest
-    if trimmed.starts_with("use ") {
-        // Collect all use statements
-        let mut use_stmts = String::new();
-        let mut rest_start = 0;
-        
-        for line in code.lines() {
-            let line_trimmed = line.trim();
-            if line_trimmed.starts_with("use ") || line_trimmed.is_empty() {
-                use_stmts.push_str(line);
-                use_stmts.push('\n');
-                rest_start += line.len() + 1; // +1 for newline
-            } else {
-                break;
+
+    let lines: Vec<&str> = code.lines().collect();
+    let mut brace_depth: i32 = 0;
+    let mut split_point = 0; // byte offset where body starts
+    let mut line_byte_offset = 0;
+
+    for (_i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+
+        if brace_depth > 0 {
+            // Inside a braced item, track depth
+            brace_depth += trimmed.chars().filter(|&c| c == '{').count() as i32;
+            brace_depth -= trimmed.chars().filter(|&c| c == '}').count() as i32;
+            line_byte_offset += line.len() + 1; // +1 for newline
+            if brace_depth <= 0 {
+                brace_depth = 0;
+                split_point = line_byte_offset;
             }
+            continue;
         }
-        
-        // If there's more code after use statements, we need to wrap it
-        let rest = &code[rest_start.min(code.len())..];
-        if !rest.trim().is_empty() {
-            return (true, use_stmts);
+
+        if trimmed.is_empty() {
+            // Blank lines between items are part of preamble
+            line_byte_offset += line.len() + 1;
+            split_point = line_byte_offset;
+            continue;
         }
-        // Only use statements, no wrapping needed
-        return (false, String::new());
+
+        if is_item_line(trimmed) {
+            // Count braces on this line
+            brace_depth += trimmed.chars().filter(|&c| c == '{').count() as i32;
+            brace_depth -= trimmed.chars().filter(|&c| c == '}').count() as i32;
+            if brace_depth < 0 {
+                brace_depth = 0;
+            }
+            line_byte_offset += line.len() + 1;
+            if brace_depth == 0 {
+                split_point = line_byte_offset;
+            }
+            continue;
+        }
+
+        // This line is a statement, everything from here is body
+        break;
     }
-    
-    // Otherwise, assume it's statement-level code that needs wrapping
-    (true, String::new())
+
+    let split_point = split_point.min(code.len());
+    let preamble = &code[..split_point];
+    let body = &code[split_point..];
+
+    if body.trim().is_empty() {
+        // All items, no wrapping needed
+        (code.to_string(), String::new())
+    } else {
+        (preamble.to_string(), body.to_string())
+    }
 }
 
 /// Process a code block and extract type annotations
@@ -116,22 +154,14 @@ pub fn process_code_block(code: &str) -> Vec<TypeAnnotation> {
         Err(_) => return vec![],
     };
 
-    // Wrap code in fn main() if needed for analysis
-    let (needs_wrap, use_stmts) = needs_main_wrapper(code);
-    // offset_for_fn_main is the extra bytes added by "fn main() {\n" that we need to subtract
-    // from positions in the wrapped code to get positions in the original code
-    let (wrapped_code, use_stmts_len, fn_main_offset) = if needs_wrap {
-        // Build wrapped code: use statements + fn main { rest of code }
-        let use_len = use_stmts.len();
-        let rest_of_code = if use_len > 0 {
-            &code[use_len..]
-        } else {
-            code
-        };
+    // Split into preamble (top-level items) and body (statements needing fn main)
+    let (preamble, body) = split_items_and_statements(code);
+    let needs_wrap = !body.is_empty();
+    let (wrapped_code, preamble_len, fn_main_offset) = if needs_wrap {
         let fn_main_prefix = "fn main() {\n";
         let suffix = "\n}";
-        let wrapped = format!("{}{}{}{}", use_stmts, fn_main_prefix, rest_of_code, suffix);
-        (wrapped, use_len as u32, fn_main_prefix.len() as u32)
+        let wrapped = format!("{}{}{}{}", preamble, fn_main_prefix, body, suffix);
+        (wrapped, preamble.len() as u32, fn_main_prefix.len() as u32)
     } else {
         (code.to_string(), 0, 0)
     };
@@ -144,16 +174,16 @@ pub fn process_code_block(code: &str) -> Vec<TypeAnnotation> {
                 .filter_map(|info| {
                     // Adjust offsets for wrapped code
                     // Positions in the wrapped code:
-                    // - 0..use_stmts_len: use statements (same positions in original)
-                    // - use_stmts_len..(use_stmts_len+fn_main_offset): "fn main() {\n" (skip)
-                    // - (use_stmts_len+fn_main_offset)..end: rest of code (subtract fn_main_offset)
-                    let wrapper_start = use_stmts_len + fn_main_offset;
+                    // - 0..preamble_len: preamble items (same positions in original)
+                    // - preamble_len..(preamble_len+fn_main_offset): "fn main() {\n" (skip)
+                    // - (preamble_len+fn_main_offset)..end: body code (subtract fn_main_offset)
+                    let wrapper_start = preamble_len + fn_main_offset;
                     
                     let adjusted_start = if fn_main_offset == 0 {
                         // No wrapping, use as-is
                         info.start
-                    } else if info.start < use_stmts_len {
-                        // In use statements section, position is same in original
+                    } else if info.start < preamble_len {
+                        // In preamble section, position is same in original
                         info.start
                     } else if info.start < wrapper_start {
                         // In "fn main() {\n" part, skip this annotation
