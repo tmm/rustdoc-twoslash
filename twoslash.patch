@@ -1,0 +1,958 @@
+diff --git a/src/librustdoc/Cargo.toml b/src/librustdoc/Cargo.toml
+index 033d3ecdd03..9d9db2119a9 100644
+--- a/src/librustdoc/Cargo.toml
++++ b/src/librustdoc/Cargo.toml
+@@ -10,6 +10,7 @@ path = "lib.rs"
+ [dependencies]
+ # tidy-alphabetical-start
+ arrayvec = { version = "0.7", default-features = false }
++once_cell = "1.18"
+ askama = { version = "0.15.4", default-features = false, features = ["alloc", "config", "derive"] }
+ base64 = "0.21.7"
+ indexmap = { version = "2", features = ["serde"] }
+@@ -28,6 +29,7 @@ threadpool = "1.8.1"
+ tracing = "0.1"
+ tracing-tree = "0.3.0"
+ unicode-segmentation = "1.9"
++twoslash-rust = { path = "/Users/tmm/Developer/vocs/twoslash-rust" }
+ # tidy-alphabetical-end
+ 
+ [dependencies.tracing-subscriber]
+diff --git a/src/librustdoc/html/highlight.rs b/src/librustdoc/html/highlight.rs
+index f70b350de28..163066ae409 100644
+--- a/src/librustdoc/html/highlight.rs
++++ b/src/librustdoc/html/highlight.rs
+@@ -13,6 +13,9 @@
+ use itertools::Either;
+ use rustc_data_structures::fx::FxIndexMap;
+ use rustc_lexer::{Cursor, FrontmatterAllowed, LiteralKind, TokenKind};
++use rustc_resolve::rustdoc::pulldown_cmark::{
++    CodeBlockKind, Event, Options, Parser, Tag, TagEnd, html,
++};
+ use rustc_span::BytePos;
+ use rustc_span::edition::Edition;
+ use rustc_span::symbol::Symbol;
+@@ -38,10 +41,23 @@ pub(crate) struct HrefContext<'a, 'tcx> {
+     pub(crate) current_href: String,
+ }
+ 
++/// Type annotation data for twoslash-style hovers
++#[derive(Debug, Clone, Default)]
++#[allow(dead_code)]
++pub(crate) struct TypeAnnotationInfo {
++    pub type_text: String,
++    pub docs: Option<String>,
++}
++
+ /// Decorations are represented as a map from CSS class to vector of character ranges.
+ /// Each range will be wrapped in a span with that class.
+ #[derive(Default)]
+-pub(crate) struct DecorationInfo(pub(crate) FxIndexMap<&'static str, Vec<(u32, u32)>>);
++pub(crate) struct DecorationInfo {
++    /// CSS class decorations keyed by class name
++    pub(crate) decorations: FxIndexMap<&'static str, Vec<(u32, u32)>>,
++    /// Type annotations keyed by byte range (start, end)
++    pub(crate) type_annotations: FxIndexMap<(u32, u32), TypeAnnotationInfo>,
++}
+ 
+ #[derive(Eq, PartialEq, Clone)]
+ pub(crate) enum Tooltip {
+@@ -58,10 +74,11 @@ pub(crate) fn render_example_with_highlighting(
+     tooltip: Option<&Tooltip>,
+     playground_button: Option<&str>,
+     extra_classes: &[String],
++    decoration_info: Option<&DecorationInfo>,
+ ) -> impl Display {
+     fmt::from_fn(move |f| {
+         write_header("rust-example-rendered", tooltip, extra_classes).fmt(f)?;
+-        write_code(f, src, None, None, None);
++        write_code(f, src, None, decoration_info, None);
+         write_footer(playground_button).fmt(f)
+     })
+ }
+@@ -208,7 +225,7 @@ fn enter_elem<W: Write>(
+                 class_info.closing_tag = Some("</span>");
+             } else if new_class.get_span().is_some()
+                 && let Some(closing_tag) =
+-                    string_without_closing_tag(out, "", Some(class_info.class), href_context, false)
++                    string_without_closing_tag(out, "", Some(class_info.class), href_context, false, None, None, 0)
+                 && !closing_tag.is_empty()
+             {
+                 class_info.closing_tag = Some(closing_tag);
+@@ -262,6 +279,9 @@ fn push<W: Write>(
+         class: Option<Class>,
+         text: Cow<'_, str>,
+         needs_escape: bool,
++        type_annotation: Option<&TypeAnnotationInfo>,
++        type_annotations: Option<&FxIndexMap<(u32, u32), TypeAnnotationInfo>>,
++        byte_offset: u32,
+     ) {
+         // If the new token cannot be merged with the currently open `Class`, we close the `Class`
+         // if possible.
+@@ -292,7 +312,7 @@ fn push<W: Write>(
+             if needs_escape { Either::Left(&EscapeBodyText(&text)) } else { Either::Right(text) };
+ 
+         let closing_tag =
+-            string_without_closing_tag(out, &text, class, href_context, should_open_tag);
++            string_without_closing_tag(out, &text, class, href_context, should_open_tag, type_annotation, type_annotations, byte_offset);
+         if class.is_some() && should_open_tag && closing_tag.is_none() {
+             panic!(
+                 "called `string_without_closing_tag` with a class but no closing tag was returned"
+@@ -347,6 +367,10 @@ struct TokenHandler<'a, 'tcx, F: Write> {
+     line_number_kind: LineNumberKind,
+     line: u32,
+     max_lines: u32,
++    /// Current byte position in the source code (for type annotation matching)
++    byte_pos: u32,
++    /// Type annotations for twoslash-style hovers (from DecorationInfo)
++    type_annotations: Option<&'a FxIndexMap<(u32, u32), TypeAnnotationInfo>>,
+ }
+ 
+ impl<F: Write> std::fmt::Debug for TokenHandler<'_, '_, F> {
+@@ -369,18 +393,52 @@ fn push_token_without_backline_check(
+         class: Option<Class>,
+         text: Cow<'a, str>,
+         needs_escape: bool,
++        type_annotation: Option<&TypeAnnotationInfo>,
++        type_annotations: Option<&FxIndexMap<(u32, u32), TypeAnnotationInfo>>,
++        byte_offset: u32,
+     ) {
+-        self.class_stack.push(self.out, &self.href_context, class, text, needs_escape);
++        self.class_stack.push(self.out, &self.href_context, class, text, needs_escape, type_annotation, type_annotations, byte_offset);
+     }
+ 
+     fn push_token(&mut self, class: Option<Class>, text: Cow<'a, str>) {
++        let text_len = text.len() as u32;
++        let start = self.byte_pos;
++        let end = start + text_len;
++
++        // Look up type annotation for this byte range
++        // First try exact match, then look for annotations that start within this token
++        let type_annotation = self.type_annotations
++            .and_then(|anns| {
++                // Exact match
++                if let Some(ann) = anns.get(&(start, end)) {
++                    return Some(ann);
++                }
++                // Find first annotation that starts within this token range
++                // This handles cases like `std::collections::HashMap` where the highlighter
++                // treats the whole path as one token but twoslash gives per-identifier annotations
++                anns.iter()
++                    .find(|((ann_start, ann_end), _)| {
++                        // Annotation starts within this token
++                        *ann_start >= start && *ann_start < end && *ann_end <= end
++                    })
++                    .map(|(_, ann)| ann)
++            });
++
++        // For path tokens containing `::`, pass the full annotations map so
++        // per-segment annotations can be resolved in string_without_closing_tag
++        let has_path_segments = text.contains("::");
++        let pass_annotations = if has_path_segments { self.type_annotations } else { None };
++
+         if text == "\n"
+             && let Some(backline) = self.handle_backline()
+         {
+             write!(self.out, "{text}{backline}").unwrap();
+         } else {
+-            self.push_token_without_backline_check(class, text, true);
++            self.push_token_without_backline_check(class, text, true, type_annotation, pass_annotations, start);
+         }
++
++        // Update byte position
++        self.byte_pos = end;
+     }
+ 
+     fn start_expansion(&mut self) {
+@@ -400,6 +458,9 @@ fn start_expansion(&mut self) {
+                 self.line,
+             )),
+             false,
++            None,
++            None,
++            0,
+         );
+ 
+         // We re-open all tags that didn't have `pending_exit` set to `true`.
+@@ -413,6 +474,9 @@ fn add_expanded_code(&mut self, expanded_code: &ExpandedCode) {
+             None,
+             Cow::Owned(format!("<span class=expanded>{}</span>", expanded_code.code)),
+             false,
++            None,
++            None,
++            0,
+         );
+         self.class_stack.enter_elem(self.out, &self.href_context, Class::Original, None);
+     }
+@@ -579,6 +643,8 @@ pub(super) fn write_code(
+         line: 0,
+         max_lines: u32::MAX,
+         class_stack: ClassStack::new(),
++        byte_pos: 0,
++        type_annotations: decoration_info.map(|d| &d.type_annotations),
+     };
+ 
+     if let Some(line_info) = line_info {
+@@ -589,6 +655,9 @@ pub(super) fn write_code(
+                 None,
+                 Cow::Owned(backline.to_string()),
+                 false,
++                None,
++                None,
++                0,
+             );
+         }
+     }
+@@ -868,7 +937,7 @@ impl Decorations {
+     fn new(info: &DecorationInfo) -> Self {
+         // Extract tuples (start, end, kind) into separate sequences of (start, kind) and (end).
+         let (mut starts, mut ends): (Vec<_>, Vec<_>) = info
+-            .0
++            .decorations
+             .iter()
+             .flat_map(|(&kind, ranges)| ranges.iter().map(move |&(lo, hi)| ((lo, kind), hi)))
+             .unzip();
+@@ -1419,8 +1488,121 @@ fn string_without_closing_tag<T: Display>(
+     klass: Option<Class>,
+     href_context: &Option<HrefContext<'_, '_>>,
+     open_tag: bool,
++    type_annotation: Option<&TypeAnnotationInfo>,
++    type_annotations: Option<&FxIndexMap<(u32, u32), TypeAnnotationInfo>>,
++    byte_offset: u32,
+ ) -> Option<&'static str> {
++    // Helper to escape text for HTML attribute (must escape quotes and newlines)
++    fn escape_for_attr(s: &str) -> String {
++        let mut result = String::with_capacity(s.len());
++        for c in s.chars() {
++            match c {
++                '"' => result.push_str("&quot;"),
++                '&' => result.push_str("&amp;"),
++                '<' => result.push_str("&lt;"),
++                '>' => result.push_str("&gt;"),
++                '\n' => result.push_str("&#10;"),
++                '\r' => result.push_str("&#13;"),
++                _ => result.push(c),
++            }
++        }
++        result
++    }
++
++    // Helper to syntax-highlight a Rust code string and return HTML
++    fn highlight_rust_code(code: &str) -> String {
++        let mut out = String::new();
++        write_code(&mut out, code, None, None, None);
++        out
++    }
++
++    // Helper to render markdown docs to HTML using pulldown-cmark,
++    // with syntax-highlighted Rust code blocks
++    fn render_docs_markdown(md: &str) -> String {
++        let mut opts = Options::empty();
++        opts.insert(Options::ENABLE_STRIKETHROUGH);
++        opts.insert(Options::ENABLE_TABLES);
++        let parser = Parser::new_ext(md, opts);
++
++        let mut html_output = String::new();
++        let mut in_code_block = false;
++        let mut is_rust_block = false;
++        let mut code_buf = String::new();
++
++        let mut non_code_events: Vec<Event<'_>> = Vec::new();
++
++        for event in parser {
++            match event {
++                Event::Start(Tag::CodeBlock(ref kind)) => {
++                    // Flush any accumulated non-code events first
++                    if !non_code_events.is_empty() {
++                        html::push_html(&mut html_output, non_code_events.drain(..));
++                    }
++                    in_code_block = true;
++                    code_buf.clear();
++                    is_rust_block = match kind {
++                        CodeBlockKind::Fenced(lang) => {
++                            let lang = lang.split(',').next().unwrap_or("").trim();
++                            lang.is_empty() || lang == "rust" || lang == "rs"
++                        }
++                        CodeBlockKind::Indented => true,
++                    };
++                }
++                Event::Text(ref text) if in_code_block => {
++                    code_buf.push_str(text);
++                }
++                Event::End(TagEnd::CodeBlock) => {
++                    in_code_block = false;
++                    if is_rust_block {
++                        html_output.push_str("<pre class=\"rust\">");
++                        html_output.push_str(&highlight_rust_code(&code_buf));
++                        html_output.push_str("</pre>");
++                    } else {
++                        html_output.push_str("<pre><code>");
++                        html_output.push_str(&EscapeBodyText(&code_buf).to_string());
++                        html_output.push_str("</code></pre>");
++                    }
++                }
++                _ => {
++                    non_code_events.push(event);
++                }
++            }
++        }
++        // Flush remaining events
++        if !non_code_events.is_empty() {
++            html::push_html(&mut html_output, non_code_events.into_iter());
++        }
++        html_output
++    }
++
++    // Helper to build data attributes for type annotations
++    // Splits type_text on "\n\n---\n\n" separator: sig (syntax-highlighted) goes in data-type, docs rendered to HTML in data-docs
++    fn build_annotation_attrs(ann: &TypeAnnotationInfo) -> String {
++        let separator = "\n\n---\n\n";
++        if let Some(sep_pos) = ann.type_text.find(separator) {
++            let sig = &ann.type_text[..sep_pos];
++            let docs = &ann.type_text[sep_pos + separator.len()..];
++            let highlighted_sig = highlight_rust_code(sig);
++            let escaped_sig = escape_for_attr(&highlighted_sig);
++            let rendered_docs = render_docs_markdown(docs);
++            let escaped_docs = escape_for_attr(&rendered_docs);
++            format!(" data-type=\"{escaped_sig}\" data-docs=\"{escaped_docs}\"")
++        } else {
++            let highlighted = highlight_rust_code(&ann.type_text);
++            let escaped = escape_for_attr(&highlighted);
++            format!(" data-type=\"{escaped}\"")
++        }
++    }
++
++    let data_type_str = type_annotation
++        .map(|ann| build_annotation_attrs(ann))
++        .unwrap_or_default();
++
+     let Some(klass) = klass else {
++        if type_annotation.is_some() {
++            write!(out, "<span{data_type_str}>{text}</span>").unwrap();
++            return Some("");
++        }
+         write!(out, "{text}").unwrap();
+         return None;
+     };
+@@ -1429,7 +1611,7 @@ fn string_without_closing_tag<T: Display>(
+             write!(out, "{text}").unwrap();
+             return None;
+         }
+-        write!(out, "<span class=\"{klass}\">{text}", klass = klass.as_html()).unwrap();
++        write!(out, "<span class=\"{klass}\"{data_type_str}>{text}", klass = klass.as_html()).unwrap();
+         return Some("</span>");
+     };
+ 
+@@ -1437,19 +1619,30 @@ fn string_without_closing_tag<T: Display>(
+     let mut text_s = text.to_string();
+     if text_s.contains("::") {
+         let mut span = def_span.with_hi(def_span.lo());
++        let mut seg_offset = byte_offset;
+         text_s = text_s.split("::").intersperse("::").fold(String::new(), |mut path, t| {
+             span = span.with_hi(span.hi() + BytePos(t.len() as _));
++            let seg_len = t.len() as u32;
++            let seg_ann = if t != "::" {
++                type_annotations.and_then(|anns| {
++                    let seg_end = seg_offset + seg_len;
++                    anns.get(&(seg_offset, seg_end))
++                })
++            } else {
++                None
++            };
++            let seg_ann_attrs = seg_ann.map(|a| build_annotation_attrs(a)).unwrap_or_default();
+             match t {
+                 "::" => write!(&mut path, "::"),
+                 "self" | "Self" => write!(
+                     &mut path,
+-                    "<span class=\"{klass}\">{t}</span>",
++                    "<span class=\"{klass}\"{seg_ann_attrs}>{t}</span>",
+                     klass = Class::Self_(DUMMY_SP).as_html(),
+                 ),
+                 "crate" | "super" => {
+                     write!(
+                         &mut path,
+-                        "<span class=\"{klass}\">{t}</span>",
++                        "<span class=\"{klass}\"{seg_ann_attrs}>{t}</span>",
+                         klass = Class::KeyWord.as_html(),
+                     )
+                 }
+@@ -1458,13 +1651,25 @@ fn string_without_closing_tag<T: Display>(
+                         && generate_link_to_def(&mut path, t, klass, href_context, span, open_tag)
+                     {
+                         added_links = true;
+-                        write!(&mut path, "</a>")
++                        if !seg_ann_attrs.is_empty() {
++                            write!(&mut path, "<span{seg_ann_attrs}>")
++                                .expect("Failed to write annotation span");
++                        }
++                        write!(&mut path, "</a>").expect("Failed to write closing </a>");
++                        if !seg_ann_attrs.is_empty() {
++                            write!(&mut path, "</span>")
++                                .expect("Failed to write closing annotation span");
++                        }
++                        Ok(())
++                    } else if !seg_ann_attrs.is_empty() {
++                        write!(&mut path, "<span{seg_ann_attrs}>{t}</span>")
+                     } else {
+                         write!(&mut path, "{t}")
+                     }
+                 }
+             }
+             .expect("Failed to build source HTML path");
++            seg_offset += seg_len;
+             span = span.with_lo(span.lo() + BytePos(t.len() as _));
+             path
+         });
+@@ -1479,10 +1684,16 @@ fn string_without_closing_tag<T: Display>(
+     }
+     let klass_s = klass.as_html();
+     if klass_s.is_empty() {
+-        out.write_str(&text_s).unwrap();
+-        Some("")
++        if type_annotation.is_some() {
++            // Self-close the data-type span immediately since there's no class to manage it
++            write!(out, "<span{data_type_str}>{text_s}</span>").unwrap();
++            Some("")
++        } else {
++            out.write_str(&text_s).unwrap();
++            Some("")
++        }
+     } else {
+-        write!(out, "<span class=\"{klass_s}\">{text_s}").unwrap();
++        write!(out, "<span class=\"{klass_s}\"{data_type_str}>{text_s}").unwrap();
+         Some("</span>")
+     }
+ }
+diff --git a/src/librustdoc/html/highlight/tests.rs b/src/librustdoc/html/highlight/tests.rs
+index 4d1bee9b3a1..7487fb0d649 100644
+--- a/src/librustdoc/html/highlight/tests.rs
++++ b/src/librustdoc/html/highlight/tests.rs
+@@ -78,7 +78,10 @@ fn test_decorations() {
+         decorations.insert("example2", vec![(22, 32)]);
+ 
+         let mut html = String::new();
+-        write_code(&mut html, src, None, Some(&DecorationInfo(decorations)), None);
++        write_code(&mut html, src, None, Some(&DecorationInfo {
++            decorations,
++            type_annotations: Default::default(),
++        }), None);
+         expect_file!["fixtures/decorations.html"].assert_eq(&html);
+     });
+ }
+diff --git a/src/librustdoc/html/markdown.rs b/src/librustdoc/html/markdown.rs
+index c472c20a7dc..422a556c96e 100644
+--- a/src/librustdoc/html/markdown.rs
++++ b/src/librustdoc/html/markdown.rs
+@@ -53,10 +53,11 @@
+ use crate::doctest;
+ use crate::doctest::GlobalTestOptions;
+ use crate::html::escape::{Escape, EscapeBodyText};
+-use crate::html::highlight;
++use crate::html::highlight::{self, TypeAnnotationInfo};
+ use crate::html::length_limit::HtmlWithLimit;
+ use crate::html::render::small_url_encode;
+ use crate::html::toc::{Toc, TocBuilder};
++use crate::html::twoslash;
+ 
+ mod footnotes;
+ #[cfg(test)]
+@@ -341,6 +342,26 @@ fn next(&mut self) -> Option<Self::Item> {
+             }
+         };
+ 
++        // Process twoslash type annotations if enabled
++        let decoration_info = if twoslash::is_enabled() {
++            let annotations = twoslash::process_code_block(&text);
++            let mut type_annotations = FxIndexMap::default();
++            for ann in annotations {
++                let start = ann.start;
++                let end = start + ann.length;
++                type_annotations.insert(
++                    (start, end),
++                    TypeAnnotationInfo { type_text: ann.type_text, docs: ann.docs },
++                );
++            }
++            Some(highlight::DecorationInfo {
++                decorations: Default::default(),
++                type_annotations,
++            })
++        } else {
++            None
++        };
++
+         // insert newline to clearly separate it from the
+         // previous block so we can shorten the html output
+         let s = format!(
+@@ -350,6 +371,7 @@ fn next(&mut self) -> Option<Self::Item> {
+                 tooltip.as_ref(),
+                 playground_button.as_deref(),
+                 &added_classes,
++                decoration_info.as_ref(),
+             )
+         );
+         Some(Event::Html(s.into()))
+diff --git a/src/librustdoc/html/mod.rs b/src/librustdoc/html/mod.rs
+index d42f4782845..ed38fb51161 100644
+--- a/src/librustdoc/html/mod.rs
++++ b/src/librustdoc/html/mod.rs
+@@ -10,6 +10,7 @@
+ pub(crate) mod sources;
+ pub(crate) mod static_files;
+ pub(crate) mod toc;
++pub(crate) mod twoslash;
+ mod url_parts_builder;
+ 
+ #[cfg(test)]
+diff --git a/src/librustdoc/html/render/mod.rs b/src/librustdoc/html/render/mod.rs
+index 86e8167dc3c..9ae6407de7e 100644
+--- a/src/librustdoc/html/render/mod.rs
++++ b/src/librustdoc/html/render/mod.rs
+@@ -2829,7 +2829,10 @@ fn render_call_locations<W: fmt::Write>(
+             file_span,
+             cx,
+             &cx.root_path(),
+-            &highlight::DecorationInfo(decoration_info),
++            &highlight::DecorationInfo {
++                decorations: decoration_info,
++                type_annotations: Default::default(),
++            },
+             &sources::SourceContext::Embedded(sources::ScrapedInfo {
+                 needs_expansion,
+                 offset: line_min,
+diff --git a/src/librustdoc/html/static/css/rustdoc.css b/src/librustdoc/html/static/css/rustdoc.css
+index 9e47f80a7fe..ee429d75879 100644
+--- a/src/librustdoc/html/static/css/rustdoc.css
++++ b/src/librustdoc/html/static/css/rustdoc.css
+@@ -3585,8 +3585,111 @@ Original by Dempfi (https://github.com/dempfi/ayu)
+ 
+ :root[data-theme="ayu"] .settings-menu > a img,
+ :root[data-theme="ayu"] #sidebar-button > a::before {
+-	filter: invert(100);
++        filter: invert(100);
+ }
+ /* End theme: ayu */
+ 
+ /* End: styles for themes */
++
++/* Twoslash type annotations */
++[data-type] {
++    text-decoration: underline dotted;
++    text-decoration-color: var(--code-highlight-prelude-ty-color);
++    cursor: help;
++}
++
++/* Twoslash tooltip element (created by JS) */
++#twoslash-tooltip {
++    position: fixed;
++    z-index: 100000;
++    background: var(--main-background-color);
++    border: 1px solid var(--border-color);
++    border-radius: 6px;
++    padding: 0;
++    font-size: 0.85em;
++    width: max-content;
++    max-width: 500px;
++    max-height: 300px;
++    overflow: auto;
++    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
++    pointer-events: none;
++    opacity: 0;
++    transition: opacity 0.15s;
++}
++
++#twoslash-tooltip.visible {
++    opacity: 1;
++    pointer-events: auto;
++}
++
++#twoslash-tooltip .twoslash-sig {
++    border-bottom: 1px solid var(--border-color);
++    padding: 8px 12px;
++}
++
++#twoslash-tooltip .twoslash-sig pre {
++    margin: 0;
++    padding: 0;
++    background: none;
++    font-family: var(--code-font);
++    font-size: 1em;
++    white-space: pre-wrap;
++    word-break: break-word;
++    color: var(--code-highlight-kw-2-color);
++}
++
++#twoslash-tooltip .twoslash-docs {
++    padding: 8px 12px;
++    font-family: var(--font-family);
++    line-height: 1.5;
++}
++
++#twoslash-tooltip .twoslash-docs p {
++    margin: 0 0 0.5em;
++}
++
++#twoslash-tooltip .twoslash-docs p:last-child {
++    margin-bottom: 0;
++}
++
++#twoslash-tooltip .twoslash-docs code {
++    background: color-mix(in srgb, var(--border-color) 30%, transparent);
++    padding: 1px 4px;
++    border-radius: 3px;
++    font-family: var(--code-font);
++    font-size: 0.9em;
++}
++
++#twoslash-tooltip .twoslash-docs pre {
++    margin: 0.5em 0;
++    padding: 8px 12px;
++    background-color: var(--code-block-background-color);
++    border-radius: var(--code-block-border-radius);
++    overflow-x: auto;
++    font-family: var(--code-font);
++    font-size: 0.875em;
++    line-height: 1.5;
++}
++
++#twoslash-tooltip .twoslash-docs pre code {
++    background: none;
++    padding: 0;
++}
++
++#twoslash-tooltip .twoslash-docs ul {
++    margin: 0.5em 0;
++    padding-left: 1.5em;
++}
++
++#twoslash-tooltip .twoslash-docs li {
++    margin: 0.25em 0;
++}
++
++#twoslash-tooltip .twoslash-docs a {
++    color: var(--src-link-color);
++    text-decoration: underline;
++}
++
++#twoslash-tooltip .twoslash-docs strong {
++    font-weight: 600;
++}
+diff --git a/src/librustdoc/html/static/js/main.js b/src/librustdoc/html/static/js/main.js
+index 42cd321849c..a5abb675656 100644
+--- a/src/librustdoc/html/static/js/main.js
++++ b/src/librustdoc/html/static/js/main.js
+@@ -2306,3 +2306,139 @@ function preLoadCss(cssUrl) {
+         event.preventDefault();
+     });
+ }());
++
++// Twoslash tooltip: position-aware tooltip using fixed positioning
++// Supports both mouse events and CSS :hover (for devtools debugging)
++(function() {
++    let tooltip = null;
++    let currentTarget = null;
++    let hoverCheckInterval = null;
++
++    function getOrCreateTooltip() {
++        if (!tooltip) {
++            tooltip = document.createElement("div");
++            tooltip.id = "twoslash-tooltip";
++            document.body.appendChild(tooltip);
++
++            // Keep tooltip visible when hovering over it
++            tooltip.addEventListener("mouseenter", function() {
++                // Don't hide while hovering tooltip
++            });
++            tooltip.addEventListener("mouseleave", function() {
++                checkHoverState();
++            });
++        }
++        return tooltip;
++    }
++
++    function showTooltip(target) {
++        const tip = getOrCreateTooltip();
++        const typeText = target.getAttribute("data-type");
++        if (!typeText) return;
++
++        const docsHtml = target.getAttribute("data-docs") || "";
++        tip.innerHTML =
++            '<div class="twoslash-sig"><pre class="rust">' + typeText + '</pre></div>' +
++            (docsHtml ? '<div class="twoslash-docs">' + docsHtml + '</div>' : '');
++        currentTarget = target;
++
++        // Position the tooltip
++        const rect = target.getBoundingClientRect();
++        const tipHeight = 200; // estimate before measuring
++        const tipWidth = 500;
++        const padding = 8;
++
++        // Default: show below
++        let top = rect.bottom + padding;
++        let left = rect.left;
++
++        // If would be cut off at bottom, show above
++        if (top + tipHeight > window.innerHeight - padding) {
++            top = rect.top - tipHeight - padding;
++        }
++
++        // If would be cut off at right, align to right edge
++        if (left + tipWidth > window.innerWidth - padding) {
++            left = window.innerWidth - tipWidth - padding;
++        }
++
++        // If would be cut off at left, align to left edge
++        if (left < padding) {
++            left = padding;
++        }
++
++        tip.style.left = left + "px";
++        tip.style.top = top + "px";
++        tip.classList.add("visible");
++
++        // Re-measure and adjust after content is set
++        requestAnimationFrame(function() {
++            const actualHeight = tip.offsetHeight;
++            // Default: show below
++            let finalTop = rect.bottom + padding;
++            // If would be cut off at bottom, show above
++            if (finalTop + actualHeight > window.innerHeight - padding) {
++                finalTop = rect.top - actualHeight - padding;
++            }
++            tip.style.top = finalTop + "px";
++        });
++
++        // Start checking hover state (for devtools :hover support)
++        startHoverCheck();
++    }
++
++    function hideTooltip() {
++        if (tooltip) {
++            tooltip.classList.remove("visible");
++        }
++        currentTarget = null;
++        stopHoverCheck();
++    }
++
++    function checkHoverState() {
++        // Check if current target or tooltip is still hovered (including devtools forced :hover)
++        const targetHovered = currentTarget && currentTarget.matches(":hover");
++        const tooltipHovered = tooltip && tooltip.matches(":hover");
++
++        if (!targetHovered && !tooltipHovered) {
++            hideTooltip();
++        }
++    }
++
++    function startHoverCheck() {
++        if (!hoverCheckInterval) {
++            hoverCheckInterval = setInterval(checkHoverState, 100);
++        }
++    }
++
++    function stopHoverCheck() {
++        if (hoverCheckInterval) {
++            clearInterval(hoverCheckInterval);
++            hoverCheckInterval = null;
++        }
++    }
++
++    // Also poll for devtools-forced :hover state
++    setInterval(function() {
++        if (currentTarget) return; // Already showing
++        const hovered = document.querySelector("[data-type]:hover");
++        if (hovered) {
++            showTooltip(hovered);
++        }
++    }, 100);
++
++    document.addEventListener("mouseover", function(event) {
++        const target = event.target;
++        if (target && target.getAttribute && target.getAttribute("data-type")) {
++            showTooltip(target);
++        }
++    });
++
++    document.addEventListener("mouseout", function(event) {
++        const target = event.target;
++        if (target && target.getAttribute && target.getAttribute("data-type")) {
++            // Delay check to allow moving to tooltip
++            setTimeout(checkHoverState, 50);
++        }
++    });
++}());
+diff --git a/src/librustdoc/html/twoslash.rs b/src/librustdoc/html/twoslash.rs
+new file mode 100644
+index 00000000000..f0bab42c7db
+--- /dev/null
++++ b/src/librustdoc/html/twoslash.rs
+@@ -0,0 +1,170 @@
++//! Twoslash integration for rustdoc
++//!
++//! Provides type hover information for code blocks.
++//!
++//! When enabled via RUSTDOC_TWOSLASH=1, this module processes Rust code blocks
++//! through rust-analyzer to extract type information for hover annotations.
++
++use once_cell::sync::Lazy;
++use std::sync::Mutex;
++use twoslash_rust::{Analyzer, AnalyzerSettings};
++
++/// Global analyzer instance (reused across code blocks)
++static ANALYZER: Lazy<Mutex<Analyzer>> = Lazy::new(|| {
++    Mutex::new(Analyzer::new(AnalyzerSettings {
++        cargo_toml: None,
++        target_dir: Some("/tmp/rustdoc-twoslash-cache".into()),
++    }))
++});
++
++/// Information about a type annotation to render
++#[derive(Debug, Clone)]
++pub struct TypeAnnotation {
++    /// Byte offset in the code where the token starts
++    pub start: u32,
++    /// Length of the token in bytes
++    pub length: u32,
++    /// The type information to display on hover
++    pub type_text: String,
++    /// Optional documentation
++    pub docs: Option<String>,
++}
++
++/// Check if twoslash processing is enabled
++pub fn is_enabled() -> bool {
++    std::env::var("RUSTDOC_TWOSLASH").is_ok()
++}
++
++/// Check if code needs to be wrapped in fn main() for analysis
++/// Returns (needs_wrap, use_statements) where use_statements should be placed before fn main
++fn needs_main_wrapper(code: &str) -> (bool, String) {
++    // If it already has fn main, don't wrap
++    if code.contains("fn main") {
++        return (false, String::new());
++    }
++    
++    let trimmed = code.trim_start();
++    
++    // If code starts with item-level keywords (not use), don't wrap
++    let item_keywords = [
++        "fn ", "struct ", "enum ", "impl ", "trait ", "mod ", 
++        "pub ", "extern ", "const ", "static ", "type ",
++        "#[", "#!", 
++    ];
++    
++    for kw in item_keywords {
++        if trimmed.starts_with(kw) {
++            return (false, String::new());
++        }
++    }
++    
++    // Handle 'use' statements specially: extract them and wrap the rest
++    if trimmed.starts_with("use ") {
++        // Collect all use statements
++        let mut use_stmts = String::new();
++        let mut rest_start = 0;
++        
++        for line in code.lines() {
++            let line_trimmed = line.trim();
++            if line_trimmed.starts_with("use ") || line_trimmed.is_empty() {
++                use_stmts.push_str(line);
++                use_stmts.push('\n');
++                rest_start += line.len() + 1; // +1 for newline
++            } else {
++                break;
++            }
++        }
++        
++        // If there's more code after use statements, we need to wrap it
++        let rest = &code[rest_start.min(code.len())..];
++        if !rest.trim().is_empty() {
++            return (true, use_stmts);
++        }
++        // Only use statements, no wrapping needed
++        return (false, String::new());
++    }
++    
++    // Otherwise, assume it's statement-level code that needs wrapping
++    (true, String::new())
++}
++
++/// Process a code block and extract type annotations
++pub fn process_code_block(code: &str) -> Vec<TypeAnnotation> {
++    let mut analyzer = match ANALYZER.lock() {
++        Ok(a) => a,
++        Err(_) => return vec![],
++    };
++
++    // Wrap code in fn main() if needed for analysis
++    let (needs_wrap, use_stmts) = needs_main_wrapper(code);
++    // offset_for_fn_main is the extra bytes added by "fn main() {\n" that we need to subtract
++    // from positions in the wrapped code to get positions in the original code
++    let (wrapped_code, use_stmts_len, fn_main_offset) = if needs_wrap {
++        // Build wrapped code: use statements + fn main { rest of code }
++        let use_len = use_stmts.len();
++        let rest_of_code = if use_len > 0 {
++            &code[use_len..]
++        } else {
++            code
++        };
++        let fn_main_prefix = "fn main() {\n";
++        let suffix = "\n}";
++        let wrapped = format!("{}{}{}{}", use_stmts, fn_main_prefix, rest_of_code, suffix);
++        (wrapped, use_len as u32, fn_main_prefix.len() as u32)
++    } else {
++        (code.to_string(), 0, 0)
++    };
++
++    match analyzer.analyze(&wrapped_code) {
++        Ok(result) => {
++            result
++                .static_quick_infos
++                .into_iter()
++                .filter_map(|info| {
++                    // Adjust offsets for wrapped code
++                    // Positions in the wrapped code:
++                    // - 0..use_stmts_len: use statements (same positions in original)
++                    // - use_stmts_len..(use_stmts_len+fn_main_offset): "fn main() {\n" (skip)
++                    // - (use_stmts_len+fn_main_offset)..end: rest of code (subtract fn_main_offset)
++                    let wrapper_start = use_stmts_len + fn_main_offset;
++                    
++                    let adjusted_start = if fn_main_offset == 0 {
++                        // No wrapping, use as-is
++                        info.start
++                    } else if info.start < use_stmts_len {
++                        // In use statements section, position is same in original
++                        info.start
++                    } else if info.start < wrapper_start {
++                        // In "fn main() {\n" part, skip this annotation
++                        return None;
++                    } else {
++                        // In the body of fn main, subtract fn_main_offset
++                        info.start - fn_main_offset
++                    };
++                    
++                    // Skip annotations that extend past the original code
++                    let original_len = code.len() as u32;
++                    if adjusted_start >= original_len {
++                        return None;
++                    }
++                    
++                    // Skip annotations for single-character tokens that are likely operators/punctuation
++                    if info.length <= 1 {
++                        return None;
++                    }
++                    
++                    Some(TypeAnnotation {
++                        start: adjusted_start,
++                        length: info.length,
++                        type_text: info.text,
++                        docs: info.docs,
++                    })
++                })
++                .collect()
++        }
++        Err(e) => {
++            eprintln!("twoslash error: {}", e);
++            vec![]
++        }
++    }
++}
