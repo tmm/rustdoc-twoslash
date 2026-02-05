@@ -11,11 +11,32 @@ use twoslash_rust::{Analyzer, AnalyzerSettings};
 
 /// Global analyzer instance (reused across code blocks)
 static ANALYZER: Lazy<Mutex<Analyzer>> = Lazy::new(|| {
+    let cargo_toml = resolve_cargo_toml();
     Mutex::new(Analyzer::new(AnalyzerSettings {
-        cargo_toml: None,
+        cargo_toml,
         target_dir: Some("/tmp/rustdoc-twoslash-cache".into()),
     }))
 });
+
+/// Resolve the Cargo.toml to use for twoslash analysis.
+///
+/// Checks RUSTDOC_TWOSLASH_CARGO_TOML env var first, then tries to find
+/// Cargo.toml relative to the current directory. This lets twoslash-rust
+/// scaffold temp projects with the same dependencies as the crate being documented.
+fn resolve_cargo_toml() -> Option<String> {
+    if let Ok(path) = std::env::var("RUSTDOC_TWOSLASH_CARGO_TOML") {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            eprintln!("twoslash: using Cargo.toml from {}", path);
+            return Some(content);
+        }
+    }
+    if let Ok(content) = std::fs::read_to_string("Cargo.toml") {
+        eprintln!("twoslash: using Cargo.toml from current directory");
+        return Some(content);
+    }
+    eprintln!("twoslash: no Cargo.toml found, external deps won't have annotations");
+    None
+}
 
 /// Information about a type annotation to render
 #[derive(Debug, Clone)]
