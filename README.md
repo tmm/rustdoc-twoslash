@@ -69,7 +69,7 @@ RUSTDOC_TWOSLASH=1 \
 
 ## Dependencies
 
-- [twoslash-rust](https://github.com/wevm/vocs/tree/main/twoslash-rust) — extracts type information from Rust code via rust-analyzer
+- [twoslash-rust](https://github.com/wevm/vocs/tree/next/twoslash-rust) — extracts type information from Rust code via rust-analyzer
 - [rust-lang/rust](https://github.com/rust-lang/rust) — the base rustdoc being modified
 
 ## Demo
